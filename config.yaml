@@ -1,0 +1,22 @@
+models:
+  - name: "model-a"
+    model_id: "facebook/opt-125m" # Lightweight example for testing
+    gpu_ids: "0"
+    port: 8001
+    args: "--max-model-len 2048 --gpu-memory-utilization 0.8"
+
+  # Uncomment to add more models
+  # - name: "model-b"
+    # model_id: "google/gemma-2b-it"
+    # gpu_ids: "1"
+    # port: 8002
+    # args: "--max-model-len 2048"
+
+storage:
+  # Directory where Hugging Face models will be stored.
+  # Map your RunPod Network Volume to this path.
+  models_dir: "/home/models"
+
+server:
+  host: "0.0.0.0"
+  port: 8000
