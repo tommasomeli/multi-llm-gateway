@@ -201,36 +201,59 @@ async def proxy_request(request: Request, port: int, path: str):
     # Extract body if present
     body = await request.body()
     
-    async with httpx.AsyncClient() as client:
-        # Prepare headers (filter hop-by-hop)
-        excluded_headers = {
-            "host", "content-length", "transfer-encoding", "connection", 
-            "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"
-        }
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
+    # Set timeout to None (infinite) to let vLLM handle timeouts
+    client = httpx.AsyncClient(timeout=None)
+    
+    # Prepare headers (filter hop-by-hop)
+    excluded_headers = {
+        "host", "content-length", "transfer-encoding", "connection", 
+        "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers", "upgrade"
+    }
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in excluded_headers}
 
-        try:
-            req = client.build_request(
-                request.method,
-                url,
-                headers=headers,
-                content=body,
-                timeout=None # Let vLLM handle timeouts
-            )
-            
-            r = await client.send(req, stream=True)
-            
-            # Filter response headers too
-            resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in excluded_headers}
+    try:
+        req = client.build_request(
+            request.method,
+            url,
+            headers=headers,
+            content=body
+        )
+        
+        r = await client.send(req, stream=True)
+        
+        # Keep all response headers except connection-related ones
+        resp_excluded = {"connection", "keep-alive", "proxy-connection", "transfer-encoding"}
+        resp_headers = {k: v for k, v in r.headers.items() if k.lower() not in resp_excluded}
+        
+        # Log content-type for debugging
+        content_type = r.headers.get("content-type", "")
+        logger.info(f"Response content-type: {content_type}")
 
-            return StreamingResponse(
-                r.aiter_raw(),
-                status_code=r.status_code,
-                headers=resp_headers,
-                background=r.aclose
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Model worker error: {exc}")
+        async def stream_with_cleanup():
+            chunk_count = 0
+            try:
+                async for chunk in r.aiter_raw():
+                    chunk_count += 1
+                    yield chunk
+                logger.info(f"Streaming completed, sent {chunk_count} chunks")
+            except (httpx.ReadError, httpx.RemoteProtocolError) as e:
+                logger.warning(f"Client disconnected during streaming after {chunk_count} chunks: {e}")
+            except Exception as e:
+                logger.error(f"Streaming error after {chunk_count} chunks: {e}")
+            finally:
+                await r.aclose()
+                await client.aclose()
+
+        # Preserve content-type from vLLM (important for text/event-stream)
+        return StreamingResponse(
+            stream_with_cleanup(),
+            status_code=r.status_code,
+            headers=resp_headers,
+            media_type=content_type
+        )
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"Model worker error: {exc}")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -242,6 +265,9 @@ async def chat_completions(request: Request):
     model_name = body.get("model")
     if not model_name or model_name not in model_map:
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' not found. Available: {list(model_map.keys())}")
+    
+    is_streaming = body.get("stream", False)
+    logger.info(f"Chat completion request for model '{model_name}', streaming={is_streaming}")
     
     port = model_map[model_name]
     return await proxy_request(request, port, "/v1/chat/completions")
